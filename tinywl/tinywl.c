@@ -39,6 +39,11 @@ struct tinywl_server {
 	struct wlr_allocator *allocator;
 	struct wlr_scene *scene;
 	struct wlr_scene_output_layout *scene_layout;
+	struct wlr_scene_tree *application_tree;
+	struct wlr_scene_tree *filter_tree;
+	struct wlr_scene_rect *filter_rect;
+	int filter_x, filter_y;
+	bool filter_visible;
 
 	struct wlr_xdg_shell *xdg_shell;
 	struct wl_listener new_xdg_toplevel;
@@ -109,6 +114,11 @@ struct tinywl_keyboard {
 	struct wl_listener key;
 	struct wl_listener destroy;
 };
+
+static void update_filter_position(struct tinywl_server *server) {
+	wlr_scene_node_set_position(&server->filter_rect->node,
+		server->filter_x, server->filter_y);
+}
 
 static void focus_toplevel(struct tinywl_toplevel *toplevel) {
 	/* Note: this function only deals with keyboard focus. */
@@ -191,6 +201,27 @@ static bool handle_keybinding(struct tinywl_server *server, xkb_keysym_t sym) {
 		struct tinywl_toplevel *next_toplevel =
 			wl_container_of(server->toplevels.prev, next_toplevel, link);
 		focus_toplevel(next_toplevel);
+		break;
+	case XKB_KEY_F2:
+		server->filter_visible = !server->filter_visible;
+		wlr_scene_node_set_enabled(&server->filter_rect->node,
+			server->filter_visible);
+		break;
+	case XKB_KEY_Left:
+		server->filter_x -= 20;
+		update_filter_position(server);
+		break;
+	case XKB_KEY_Right:
+		server->filter_x += 20;
+		update_filter_position(server);
+		break;
+	case XKB_KEY_Up:
+		server->filter_y -= 20;
+		update_filter_position(server);
+		break;
+	case XKB_KEY_Down:
+		server->filter_y += 20;
+		update_filter_position(server);
 		break;
 	default:
 		return false;
@@ -360,11 +391,11 @@ static void seat_request_set_selection(struct wl_listener *listener, void *data)
 static struct tinywl_toplevel *desktop_toplevel_at(
 		struct tinywl_server *server, double lx, double ly,
 		struct wlr_surface **surface, double *sx, double *sy) {
-	/* This returns the topmost node in the scene at the given layout coords.
+	/* Only applications participate in hit-testing; the filter is visual-only.
 	 * We only care about surface nodes as we are specifically looking for a
 	 * surface in the surface tree of a tinywl_toplevel. */
 	struct wlr_scene_node *node = wlr_scene_node_at(
-		&server->scene->tree.node, lx, ly, sx, sy);
+		&server->application_tree->node, lx, ly, sx, sy);
 	if (node == NULL || node->type != WLR_SCENE_NODE_BUFFER) {
 		return NULL;
 	}
@@ -810,7 +841,7 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
 	toplevel->server = server;
 	toplevel->xdg_toplevel = xdg_toplevel;
 	toplevel->scene_tree =
-		wlr_scene_xdg_surface_create(&toplevel->server->scene->tree, xdg_toplevel->base);
+		wlr_scene_xdg_surface_create(toplevel->server->application_tree, xdg_toplevel->base);
 	toplevel->scene_tree->node.data = toplevel;
 	xdg_toplevel->base->data = toplevel->scene_tree;
 
@@ -970,6 +1001,14 @@ int main(int argc, char *argv[]) {
 	 */
 	server.scene = wlr_scene_create();
 	server.scene_layout = wlr_scene_attach_output_layout(server.scene, server.output_layout);
+	server.application_tree = wlr_scene_tree_create(&server.scene->tree);
+	server.filter_tree = wlr_scene_tree_create(&server.scene->tree);
+	const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+	server.filter_rect = wlr_scene_rect_create(server.filter_tree, 300, 200, black);
+	server.filter_x = 100;
+	server.filter_y = 100;
+	server.filter_visible = true;
+	update_filter_position(&server);
 
 	/* Set up xdg-shell version 3. The xdg-shell is a Wayland protocol which is
 	 * used for application windows. For more detail on shells, refer to
