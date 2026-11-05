@@ -24,6 +24,7 @@
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/log.h>
 #include <xkbcommon/xkbcommon.h>
+#include <wlr/types/wlr_buffer.h>
 
 /* For brevity's sake, struct members are annotated where they are used. */
 enum tinywl_cursor_mode {
@@ -118,6 +119,40 @@ struct tinywl_keyboard {
 static void update_filter_position(struct tinywl_server *server) {
 	wlr_scene_node_set_position(&server->filter_rect->node,
 		server->filter_x, server->filter_y);
+}
+static void inspect_scene_buffer(
+        struct wlr_scene_buffer *scene_buffer,
+        int sx, int sy, void *user_data) {
+
+    if (scene_buffer->buffer == NULL) {
+        return;
+    }
+
+    struct wlr_buffer *buffer = scene_buffer->buffer;
+
+    wlr_log(WLR_INFO,
+        "Buffer: %dx%d at layout position (%d, %d)",
+        buffer->width,
+        buffer->height,
+        sx, sy);
+
+    int *count = user_data;
+    (*count)++;
+}
+
+static void inspect_application_buffers(
+        struct tinywl_server *server) {
+
+    int count = 0;
+
+    wlr_scene_node_for_each_buffer(
+        &server->application_tree->node,
+        inspect_scene_buffer,
+        &count
+    );
+
+    wlr_log(WLR_INFO,
+        "Found %d application scene buffers", count);
 }
 
 static void focus_toplevel(struct tinywl_toplevel *toplevel) {
@@ -222,6 +257,9 @@ static bool handle_keybinding(struct tinywl_server *server, xkb_keysym_t sym) {
 	case XKB_KEY_Down:
 		server->filter_y += 20;
 		update_filter_position(server);
+		break;
+	case XKB_KEY_b:
+		inspect_application_buffers(server);
 		break;
 	default:
 		return false;
