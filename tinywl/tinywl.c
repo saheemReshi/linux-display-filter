@@ -129,6 +129,38 @@ static void inspect_scene_buffer(
     }
 
     struct wlr_buffer *buffer = scene_buffer->buffer;
+	void *pixels = NULL;
+	uint32_t format = 0;
+	size_t stride = 0;
+
+	bool success = wlr_buffer_begin_data_ptr_access(
+		buffer,
+		WLR_BUFFER_DATA_PTR_ACCESS_READ,
+		&pixels,
+		&format,
+		&stride
+	);
+
+	if (success) {
+		wlr_log(WLR_INFO,
+			"CPU access OK: %dx%d, format=0x%08x, stride=%zu",
+			buffer->width, buffer->height, format, stride);
+
+		if (pixels != NULL && stride >= 4 &&
+				buffer->width > 0 && buffer->height > 0) {
+			const unsigned char *p = pixels;
+
+			wlr_log(WLR_INFO,
+				"First four pixel bytes: %02x %02x %02x %02x",
+				p[0], p[1], p[2], p[3]);
+		}
+
+		wlr_buffer_end_data_ptr_access(buffer);
+	} else {
+		wlr_log(WLR_INFO,
+			"CPU access unavailable: %dx%d",
+			buffer->width, buffer->height);
+	}
 
     wlr_log(WLR_INFO,
         "Buffer: %dx%d at layout position (%d, %d)",
