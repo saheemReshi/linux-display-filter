@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdint.h>
+#include <drm/drm_fourcc.h>
+#include <wlr/render/wlr_texture.h>
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
 #include <wlr/render/allocator.h>
@@ -45,7 +48,7 @@ struct tinywl_server {
 	struct wlr_scene_rect *filter_rect;
 	int filter_x, filter_y;
 	bool filter_visible;
-
+	bool capture_requested;//added for capturing screen content on alt+P
 	struct wlr_xdg_shell *xdg_shell;
 	struct wl_listener new_xdg_toplevel;
 	struct wl_listener new_xdg_popup;
@@ -293,6 +296,10 @@ static bool handle_keybinding(struct tinywl_server *server, xkb_keysym_t sym) {
 	case XKB_KEY_b:
 		inspect_application_buffers(server);
 		break;
+	case XKB_KEY_p:
+    server->capture_requested = true;
+    wlr_log(WLR_INFO, "Output capture requested");
+    break;
 	default:
 		return false;
 	}
@@ -671,6 +678,121 @@ static void server_cursor_frame(struct wl_listener *listener, void *data) {
 	wlr_seat_pointer_notify_frame(server->seat);
 }
 
+static bool save_output_ppm(
+        struct tinywl_server *server,
+        struct wlr_buffer *buffer) {
+
+    // Import the output buffer as a renderer texture.
+    struct wlr_texture *texture =
+        wlr_texture_from_buffer(server->renderer, buffer);
+
+    if (texture == NULL) {
+        wlr_log(WLR_ERROR, "Could not import output texture");
+        return false;
+    }
+
+    uint32_t width = texture->width;
+    uint32_t height = texture->height;
+    uint32_t format = wlr_texture_preferred_read_format(texture);
+
+    // This first experiment supports common 8-bit,
+    // 4-byte-per-pixel formats on little-endian machines.
+    bool rgb_order =
+        format == DRM_FORMAT_ABGR8888 ||
+        format == DRM_FORMAT_XBGR8888;
+
+    bool bgr_order =
+        format == DRM_FORMAT_ARGB8888 ||
+        format == DRM_FORMAT_XRGB8888;
+
+    if ((!rgb_order && !bgr_order) ||
+            width == 0 || height == 0 ||
+            width > 8192 || height > 8192) {
+        wlr_log(WLR_ERROR,
+            "Unsupported capture dimensions/format: %ux%u 0x%08x",
+            width, height, format);
+        wlr_texture_destroy(texture);
+        return false;
+    }
+
+    uint32_t stride = width * 4;
+    uint8_t *pixels = malloc((size_t)stride * height);
+
+    if (pixels == NULL) {
+        wlr_texture_destroy(texture);
+        return false;
+    }
+
+    struct wlr_texture_read_pixels_options options = {
+        .data = pixels,
+        .format = format,
+        .stride = stride,
+    };
+
+    bool success = wlr_texture_read_pixels(texture, &options);
+    wlr_texture_destroy(texture);
+
+    if (!success) {
+        wlr_log(WLR_ERROR, "Texture pixel readback failed");
+        free(pixels);
+        return false;
+    }
+
+    // PPM stores 3 bytes per pixel: R, G, B.
+    FILE *file = fopen("capture.ppm", "wb");
+    if (file == NULL) {
+        free(pixels);
+        return false;
+    }
+
+    fprintf(file, "P6\n%u %u\n255\n", width, height);
+
+    uint8_t *row = malloc((size_t)width * 3);
+    if (row == NULL) {
+        fclose(file);
+        free(pixels);
+        return false;
+    }
+
+    success = true;
+
+    for (uint32_t y = 0; y < height; y++) {
+        const uint8_t *src = pixels + (size_t)y * stride;
+
+        for (uint32_t x = 0; x < width; x++) {
+            const uint8_t *p = src + x * 4;
+
+            // Convert the DRM format's memory byte order
+            // into RGB for the PPM file.
+            row[x * 3 + 0] = rgb_order ? p[0] : p[2];
+            row[x * 3 + 1] = p[1];
+            row[x * 3 + 2] = rgb_order ? p[2] : p[0];
+        }
+
+        if (fwrite(row, 1, (size_t)width * 3, file)
+                != (size_t)width * 3) {
+            success = false;
+            break;
+        }
+    }
+
+    if (fclose(file) != 0) {
+        success = false;
+    }
+
+    free(row);
+    free(pixels);
+
+    if (success) {
+        wlr_log(WLR_INFO, "Saved capture.ppm (%ux%u)",
+            width, height);
+    } else {
+        wlr_log(WLR_ERROR, "Failed to save complete PPM");
+    }
+
+    return success;
+}
+
 static void output_frame(struct wl_listener *listener, void *data) {
 	/* This function is called every time an output is ready to display a frame,
 	 * generally at the output's refresh rate (e.g. 60Hz). */
@@ -691,18 +813,30 @@ static void output_frame(struct wl_listener *listener, void *data) {
 
 		if (ok) {
 			// Our interception point
+			// if ((state.committed & WLR_OUTPUT_STATE_BUFFER) &&
+			// 		state.buffer != NULL) {
+
+			// 	static bool logged = false;
+
+			// 	if (!logged) {
+			// 		wlr_log(WLR_INFO,
+			// 			"Output buffer: %dx%d",
+			// 			state.buffer->width,
+			// 			state.buffer->height);
+
+			// 		logged = true;
+			// 	}
+			// }
 			if ((state.committed & WLR_OUTPUT_STATE_BUFFER) &&
 					state.buffer != NULL) {
 
-				static bool logged = false;
+				if (output->server->capture_requested) {
+					output->server->capture_requested = false;
 
-				if (!logged) {
-					wlr_log(WLR_INFO,
-						"Output buffer: %dx%d",
-						state.buffer->width,
-						state.buffer->height);
-
-					logged = true;
+					save_output_ppm(
+						output->server,
+						state.buffer
+					);
 				}
 			}
 
