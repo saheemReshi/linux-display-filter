@@ -681,7 +681,41 @@ static void output_frame(struct wl_listener *listener, void *data) {
 		scene, output->wlr_output);
 
 	/* Render the scene if needed and commit the output */
-	wlr_scene_output_commit(scene_output, NULL);
+	//wlr_scene_output_commit(scene_output, NULL);  opening up this function below
+	if (wlr_scene_output_needs_frame(scene_output)) {
+		struct wlr_output_state state;
+		wlr_output_state_init(&state);
+
+		bool ok = wlr_scene_output_build_state(
+			scene_output, &state, NULL);
+
+		if (ok) {
+			// Our interception point
+			if ((state.committed & WLR_OUTPUT_STATE_BUFFER) &&
+					state.buffer != NULL) {
+
+				static bool logged = false;
+
+				if (!logged) {
+					wlr_log(WLR_INFO,
+						"Output buffer: %dx%d",
+						state.buffer->width,
+						state.buffer->height);
+
+					logged = true;
+				}
+			}
+
+			ok = wlr_output_commit_state(
+				output->wlr_output, &state);
+		}
+
+		wlr_output_state_finish(&state);
+
+		if (!ok) {
+			wlr_log(WLR_ERROR, "Output render/commit failed");
+		}
+	}
 
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
