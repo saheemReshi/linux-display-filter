@@ -11,6 +11,8 @@
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
 #include <wlr/render/allocator.h>
+#include <wlr/render/gles2.h>
+#include <wlr/render/pass.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_compositor.h>
@@ -793,6 +795,42 @@ static bool save_output_ppm(
     return success;
 }
 
+static bool render_output_grey_rect(struct wlr_renderer *renderer,
+		struct wlr_output_state *state) {
+	if (!wlr_renderer_is_gles2(renderer)) {
+		wlr_log(WLR_ERROR, "Synchronous grey rectangle requires GLES2");
+		return false;
+	}
+
+	struct wlr_render_pass *pass =
+		wlr_renderer_begin_buffer_pass(renderer, state->buffer, NULL);
+	if (pass == NULL) {
+		wlr_log(WLR_ERROR, "Could not begin grey rectangle pass");
+		return false;
+	}
+
+	const struct wlr_box box = { .x = 50, .y = 50, .width = 200, .height = 100 };
+	wlr_render_pass_add_rect(pass, &(struct wlr_render_rect_options){
+		.box = box,
+		.color = { .r = 0.5f, .g = 0.5f, .b = 0.5f, .a = 1.0f },
+		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
+	});
+	/* GLES2 issues drawing immediately; wait while its context is current. */
+	glFinish();
+	if (!wlr_render_pass_submit(pass)) {
+		return false;
+	}
+
+	pixman_region32_t damage;
+	pixman_region32_init_rect(&damage, box.x, box.y, box.width, box.height);
+	pixman_region32_union(&damage, &damage, &state->damage);
+	pixman_region32_intersect_rect(&damage, &damage, 0, 0,
+		state->buffer->width, state->buffer->height);
+	wlr_output_state_set_damage(state, &damage);
+	pixman_region32_fini(&damage);
+	return true;
+}
+
 static void output_frame(struct wl_listener *listener, void *data) {
 	/* This function is called every time an output is ready to display a frame,
 	 * generally at the output's refresh rate (e.g. 60Hz). */
@@ -808,8 +846,11 @@ static void output_frame(struct wl_listener *listener, void *data) {
 		struct wlr_output_state state;
 		wlr_output_state_init(&state);
 
+		/* Require composition for future output post-processing. */
+		wlr_output_lock_attach_render(output->wlr_output, true);
 		bool ok = wlr_scene_output_build_state(
 			scene_output, &state, NULL);
+		wlr_output_lock_attach_render(output->wlr_output, false);
 
 		if (ok) {
 			// Our interception point
@@ -829,8 +870,9 @@ static void output_frame(struct wl_listener *listener, void *data) {
 			// }
 			if ((state.committed & WLR_OUTPUT_STATE_BUFFER) &&
 					state.buffer != NULL) {
+				ok = render_output_grey_rect(output->wlr_output->renderer, &state);
 
-				if (output->server->capture_requested) {
+				if (ok && output->server->capture_requested) {
 					output->server->capture_requested = false;
 
 					save_output_ppm(
@@ -840,8 +882,10 @@ static void output_frame(struct wl_listener *listener, void *data) {
 				}
 			}
 
-			ok = wlr_output_commit_state(
-				output->wlr_output, &state);
+			if (ok) {
+				ok = wlr_output_commit_state(
+					output->wlr_output, &state);
+			}
 		}
 
 		wlr_output_state_finish(&state);

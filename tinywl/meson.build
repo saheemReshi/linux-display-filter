@@ -1,5 +1,5 @@
 executable(
 	'tinywl',
 	'tinywl.c',
-	dependencies: wlroots,
+	dependencies: [wlroots, dependency('glesv2'), dependency('pixman-1')],
 )
