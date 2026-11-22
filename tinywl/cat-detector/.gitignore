@@ -2,3 +2,5 @@
 /nanodet.onnx
 /cats.jpg
 /cats.png
+/*.o
+/libcat-detector.a

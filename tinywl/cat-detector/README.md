@@ -73,7 +73,38 @@ Calls on one detector must be sequential because its network has mutable input
 and execution state. OpenCV's global thread count remains the caller's choice;
 the standalone program requests one thread before constructing its detector.
 
-This is a C++ interface. A C-compatible wrapper for TinyWL is a later stage.
+This is the C++ interface. C callers use the wrapper described below.
+
+## C interface
+
+`cat_detector_c.h` is usable from C; it exposes no OpenCV or C++ container types.
+`cat_detector_c.cpp` implements the wrapper. The build also produces the static
+library `libcat-detector.a`. Compile a consumer as C, then use the C++ driver for
+the final link with that library and the OpenCV libraries. The existing C++ CLI
+continues to work.
+
+- `cat_detector_create` loads the model and returns an opaque handle, or NULL
+  with error text. It requests one OpenCV thread, a process-wide setting.
+- `cat_detector_detect` borrows a `cat_image_bgr` and writes a `cat_result`.
+  Pixels are 8-bit BGR (three bytes per pixel); the supplied allocation must
+  cover `stride * height` bytes, including any row padding. Dimensions, stride,
+  byte count, and overflow are checked before constructing an OpenCV view.
+- The caller owns both pixels and the result's box array. Set `boxes` and
+  `capacity` before calling; no cross-language pixel/result allocation is needed.
+- `CAT_OK` means all boxes were copied; zero cats is a successful result.
+  `CAT_BUFFER_TOO_SMALL` means no boxes were copied, and `count` tells the caller
+  the required capacity. `CAT_ERROR` reports invalid input or an exception.
+  Count and timing reset on entry; insufficient capacity returns actual count
+  and inference timing. Boxes remain unchanged on either failure status.
+- Error text uses a caller-owned buffer. It is cleared on success and truncated
+  with a terminating zero byte when space is limited. Passing NULL omits text.
+- The wrapper catches C++ exceptions and returns errors to C. Results contain
+  plain integer coordinates and float confidence values; they outlive the call.
+- `cat_detector_destroy` releases the handle. Do not call `free` on it. NULL is
+  accepted. Calls on one handle must be sequential.
+
+This stage accepts BGR pixels only. Conversion from TinyWL's four-byte DRM
+readback formats, and use from its rendering callbacks, remain separate steps.
 
 ## Reading the implementation
 
