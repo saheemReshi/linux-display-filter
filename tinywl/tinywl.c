@@ -17,6 +17,7 @@
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_data_device.h>
+#include <wlr/types/wlr_damage_ring.h>
 #include <wlr/types/wlr_input_device.h>
 #include <wlr/types/wlr_keyboard.h>
 #include <wlr/types/wlr_output.h>
@@ -50,7 +51,7 @@ struct tinywl_server {
 	struct wlr_scene_rect *filter_rect;
 	int filter_x, filter_y;
 	bool filter_visible;
-	bool capture_requested;//added for capturing screen content on alt+P
+	bool capture_requested; /* Capture clean scene pixels on Alt+P. */
 	struct wlr_xdg_shell *xdg_shell;
 	struct wl_listener new_xdg_toplevel;
 	struct wl_listener new_xdg_popup;
@@ -298,10 +299,15 @@ static bool handle_keybinding(struct tinywl_server *server, xkb_keysym_t sym) {
 	case XKB_KEY_b:
 		inspect_application_buffers(server);
 		break;
-	case XKB_KEY_p:
-    server->capture_requested = true;
-    wlr_log(WLR_INFO, "Output capture requested");
-    break;
+	case XKB_KEY_p: {
+		server->capture_requested = true;
+		struct tinywl_output *output;
+		wl_list_for_each(output, &server->outputs, link) {
+			wlr_output_schedule_frame(output->wlr_output);
+		}
+		wlr_log(WLR_INFO, "Clean scene capture requested");
+		break;
+	}
 	default:
 		return false;
 	}
@@ -680,13 +686,22 @@ static void server_cursor_frame(struct wl_listener *listener, void *data) {
 	wlr_seat_pointer_notify_frame(server->seat);
 }
 
-static bool save_output_ppm(
-        struct tinywl_server *server,
-        struct wlr_buffer *buffer) {
+struct tinywl_image {
+    uint8_t *data;
+    uint32_t width, height;
+    uint32_t stride;
+    uint32_t format;
+};
+
+/* On success, the caller owns image->data and must free() it. */
+static bool read_output_pixels(
+        struct wlr_renderer *renderer,
+        struct wlr_buffer *buffer,
+        struct tinywl_image *image) {
 
     // Import the output buffer as a renderer texture.
     struct wlr_texture *texture =
-        wlr_texture_from_buffer(server->renderer, buffer);
+        wlr_texture_from_buffer(renderer, buffer);
 
     if (texture == NULL) {
         wlr_log(WLR_ERROR, "Could not import output texture");
@@ -740,6 +755,30 @@ static bool save_output_ppm(
         return false;
     }
 
+    *image = (struct tinywl_image){
+        .data = pixels,
+        .width = width,
+        .height = height,
+        .stride = stride,
+        .format = format,
+    };
+    return true;
+}
+
+static bool save_output_ppm(
+        struct tinywl_server *server,
+        struct wlr_buffer *buffer) {
+    struct tinywl_image image = {0};
+    if (!read_output_pixels(server->renderer, buffer, &image)) {
+        return false;
+    }
+
+    uint8_t *pixels = image.data;
+    uint32_t width = image.width, height = image.height;
+    uint32_t stride = image.stride;
+    bool rgb_order = image.format == DRM_FORMAT_ABGR8888 ||
+        image.format == DRM_FORMAT_XBGR8888;
+
     // PPM stores 3 bytes per pixel: R, G, B.
     FILE *file = fopen("capture.ppm", "wb");
     if (file == NULL) {
@@ -756,7 +795,7 @@ static bool save_output_ppm(
         return false;
     }
 
-    success = true;
+    bool success = true;
 
     for (uint32_t y = 0; y < height; y++) {
         const uint8_t *src = pixels + (size_t)y * stride;
@@ -842,9 +881,15 @@ static void output_frame(struct wl_listener *listener, void *data) {
 
 	/* Render the scene if needed and commit the output */
 	//wlr_scene_output_commit(scene_output, NULL);  opening up this function below
-	if (wlr_scene_output_needs_frame(scene_output)) {
+	if (output->server->capture_requested ||
+			wlr_scene_output_needs_frame(scene_output)) {
 		struct wlr_output_state state;
 		wlr_output_state_init(&state);
+
+		if (output->server->capture_requested) {
+			/* Repaint pixels left by post-processing in reused buffers. */
+			wlr_damage_ring_add_whole(&scene_output->damage_ring);
+		}
 
 		/* Require composition for future output post-processing. */
 		wlr_output_lock_attach_render(output->wlr_output, true);
@@ -870,9 +915,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
 			// }
 			if ((state.committed & WLR_OUTPUT_STATE_BUFFER) &&
 					state.buffer != NULL) {
-				ok = render_output_grey_rect(output->wlr_output->renderer, &state);
-
-				if (ok && output->server->capture_requested) {
+				if (output->server->capture_requested) {
 					output->server->capture_requested = false;
 
 					save_output_ppm(
@@ -880,6 +923,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
 						state.buffer
 					);
 				}
+				ok = render_output_grey_rect(output->wlr_output->renderer, &state);
 			}
 
 			if (ok) {
