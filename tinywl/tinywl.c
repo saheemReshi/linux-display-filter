@@ -31,6 +31,8 @@
 #include <wlr/util/log.h>
 #include <xkbcommon/xkbcommon.h>
 #include <wlr/types/wlr_buffer.h>
+#include "cat-detector/cat_detector_c.h"
+#include "cat-detector/readback_bgr.h"
 
 /* For brevity's sake, struct members are annotated where they are used. */
 enum tinywl_cursor_mode {
@@ -52,6 +54,7 @@ struct tinywl_server {
 	int filter_x, filter_y;
 	bool filter_visible;
 	bool capture_requested; /* Capture clean scene pixels on Alt+P. */
+	struct cat_detector *cat_detector;
 	struct wlr_xdg_shell *xdg_shell;
 	struct wl_listener new_xdg_toplevel;
 	struct wl_listener new_xdg_popup;
@@ -89,6 +92,8 @@ struct tinywl_output {
 	struct wl_listener frame;
 	struct wl_listener request_state;
 	struct wl_listener destroy;
+	struct cat_box *cat_boxes;
+	size_t cat_capacity;
 };
 
 struct tinywl_toplevel {
@@ -765,24 +770,17 @@ static bool read_output_pixels(
     return true;
 }
 
-static bool save_output_ppm(
-        struct tinywl_server *server,
-        struct wlr_buffer *buffer) {
-    struct tinywl_image image = {0};
-    if (!read_output_pixels(server->renderer, buffer, &image)) {
-        return false;
-    }
-
-    uint8_t *pixels = image.data;
-    uint32_t width = image.width, height = image.height;
-    uint32_t stride = image.stride;
-    bool rgb_order = image.format == DRM_FORMAT_ABGR8888 ||
-        image.format == DRM_FORMAT_XBGR8888;
+/* Borrows the clean CPU image; the caller retains ownership of its pixels. */
+static bool save_output_ppm(const struct tinywl_image *image) {
+    const uint8_t *pixels = image->data;
+    uint32_t width = image->width, height = image->height;
+    uint32_t stride = image->stride;
+    bool rgb_order = image->format == DRM_FORMAT_ABGR8888 ||
+        image->format == DRM_FORMAT_XBGR8888;
 
     // PPM stores 3 bytes per pixel: R, G, B.
     FILE *file = fopen("capture.ppm", "wb");
     if (file == NULL) {
-        free(pixels);
         return false;
     }
 
@@ -791,7 +789,6 @@ static bool save_output_ppm(
     uint8_t *row = malloc((size_t)width * 3);
     if (row == NULL) {
         fclose(file);
-        free(pixels);
         return false;
     }
 
@@ -822,7 +819,6 @@ static bool save_output_ppm(
     }
 
     free(row);
-    free(pixels);
 
     if (success) {
         wlr_log(WLR_INFO, "Saved capture.ppm (%ux%u)",
@@ -834,40 +830,94 @@ static bool save_output_ppm(
     return success;
 }
 
-static bool render_output_grey_rect(struct wlr_renderer *renderer,
-		struct wlr_output_state *state) {
-	if (!wlr_renderer_is_gles2(renderer)) {
-		wlr_log(WLR_ERROR, "Synchronous grey rectangle requires GLES2");
+static bool detect_output_cats(struct tinywl_output *output,
+		const struct tinywl_image *image, struct cat_result *result) {
+	if (output->cat_capacity == 0) {
+		output->cat_boxes = malloc(64 * sizeof(*output->cat_boxes));
+		if (output->cat_boxes == NULL) {
+			wlr_log(WLR_ERROR, "Could not allocate cat box storage");
+			return false;
+		}
+		output->cat_capacity = 64;
+	}
+	uint8_t *bgr = cat_readback_to_bgr(image->data,
+		(size_t)image->stride * image->height, image->width, image->height,
+		image->stride, image->format);
+	if (bgr == NULL) {
+		wlr_log(WLR_ERROR, "Could not convert output pixels to BGR");
 		return false;
+	}
+	struct cat_image_bgr input = {
+		.data = bgr, .width = image->width, .height = image->height,
+		.stride = (size_t)image->width * 3,
+		.size_bytes = (size_t)image->width * 3 * image->height,
+	};
+	*result = (struct cat_result){
+		.boxes = output->cat_boxes, .capacity = output->cat_capacity,
+	};
+	char error[256];
+	int status = cat_detector_detect(output->server->cat_detector,
+		&input, result, error, sizeof(error));
+	if (status == CAT_BUFFER_TOO_SMALL) {
+		if (result->count > SIZE_MAX / sizeof(*output->cat_boxes)) {
+			free(bgr);
+			wlr_log(WLR_ERROR, "Cat box allocation size overflow");
+			return false;
+		}
+		struct cat_box *boxes = realloc(output->cat_boxes,
+			result->count * sizeof(*output->cat_boxes));
+		if (boxes == NULL) {
+			free(bgr);
+			wlr_log(WLR_ERROR, "Could not grow cat box storage");
+			return false;
+		}
+		output->cat_boxes = boxes;
+		output->cat_capacity = result->count;
+		result->boxes = boxes;
+		result->capacity = output->cat_capacity;
+		status = cat_detector_detect(output->server->cat_detector,
+			&input, result, error, sizeof(error));
+	}
+	free(bgr);
+	if (status != CAT_OK) {
+		wlr_log(WLR_ERROR, "Cat detection failed: %s", error);
+		return false;
+	}
+	wlr_log(WLR_DEBUG, "Cat detection: %zu cats, model forward %.2f ms",
+		result->count, result->inference_ms);
+	return true;
+}
+
+static bool render_cat_boxes(struct wlr_renderer *renderer,
+		struct wlr_output_state *state, const struct cat_result *cats) {
+	/* Both repaint and commit damage are whole-output in this prototype.
+	 * This also removes old masks on frames where no cats are detected. */
+	pixman_region32_t damage;
+	pixman_region32_init_rect(&damage, 0, 0, state->buffer->width, state->buffer->height);
+	wlr_output_state_set_damage(state, &damage);
+	pixman_region32_fini(&damage);
+	if (cats->count == 0) {
+		return true;
 	}
 
 	struct wlr_render_pass *pass =
 		wlr_renderer_begin_buffer_pass(renderer, state->buffer, NULL);
 	if (pass == NULL) {
-		wlr_log(WLR_ERROR, "Could not begin grey rectangle pass");
+		wlr_log(WLR_ERROR, "Could not begin cat mask pass");
 		return false;
 	}
 
-	const struct wlr_box box = { .x = 50, .y = 50, .width = 200, .height = 100 };
-	wlr_render_pass_add_rect(pass, &(struct wlr_render_rect_options){
-		.box = box,
-		.color = { .r = 0.5f, .g = 0.5f, .b = 0.5f, .a = 1.0f },
-		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
-	});
+	for (size_t i = 0; i < cats->count; ++i) {
+		const struct cat_box *box = &cats->boxes[i];
+		wlr_render_pass_add_rect(pass, &(struct wlr_render_rect_options){
+			.box = { .x = box->x, .y = box->y, .width = box->width, .height = box->height },
+			.color = { .r = 0.5f, .g = 0.5f, .b = 0.5f, .a = 1.0f },
+			.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
+		});
+	}
 	/* GLES2 issues drawing immediately; wait while its context is current. */
 	glFinish();
-	if (!wlr_render_pass_submit(pass)) {
-		return false;
-	}
-
-	pixman_region32_t damage;
-	pixman_region32_init_rect(&damage, box.x, box.y, box.width, box.height);
-	pixman_region32_union(&damage, &damage, &state->damage);
-	pixman_region32_intersect_rect(&damage, &damage, 0, 0,
-		state->buffer->width, state->buffer->height);
-	wlr_output_state_set_damage(state, &damage);
-	pixman_region32_fini(&damage);
-	return true;
+	return wlr_render_pass_submit(pass);
 }
 
 static void output_frame(struct wl_listener *listener, void *data) {
@@ -886,10 +936,8 @@ static void output_frame(struct wl_listener *listener, void *data) {
 		struct wlr_output_state state;
 		wlr_output_state_init(&state);
 
-		if (output->server->capture_requested) {
-			/* Repaint pixels left by post-processing in reused buffers. */
-			wlr_damage_ring_add_whole(&scene_output->damage_ring);
-		}
+		/* Always give the detector a clean scene, including reused buffers. */
+		wlr_damage_ring_add_whole(&scene_output->damage_ring);
 
 		/* Require composition for future output post-processing. */
 		wlr_output_lock_attach_render(output->wlr_output, true);
@@ -915,15 +963,22 @@ static void output_frame(struct wl_listener *listener, void *data) {
 			// }
 			if ((state.committed & WLR_OUTPUT_STATE_BUFFER) &&
 					state.buffer != NULL) {
-				if (output->server->capture_requested) {
-					output->server->capture_requested = false;
-
-					save_output_ppm(
-						output->server,
-						state.buffer
-					);
+				struct tinywl_image image = {0};
+				ok = read_output_pixels(output->wlr_output->renderer, state.buffer, &image);
+				if (ok) {
+					if (output->server->capture_requested) {
+						output->server->capture_requested = false;
+						if (!save_output_ppm(&image)) {
+							wlr_log(WLR_ERROR, "Could not save capture.ppm");
+						}
+					}
+					struct cat_result cats = {0};
+					ok = detect_output_cats(output, &image, &cats);
+					if (ok) {
+						ok = render_cat_boxes(output->wlr_output->renderer, &state, &cats);
+					}
+					free(image.data);
 				}
-				ok = render_output_grey_rect(output->wlr_output->renderer, &state);
 			}
 
 			if (ok) {
@@ -960,6 +1015,7 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&output->request_state.link);
 	wl_list_remove(&output->destroy.link);
 	wl_list_remove(&output->link);
+	free(output->cat_boxes);
 	free(output);
 }
 
@@ -1284,6 +1340,13 @@ int main(int argc, char *argv[]) {
 		wlr_log(WLR_ERROR, "failed to create wlr_renderer");
 		return 1;
 	}
+	if (!wlr_renderer_is_gles2(server.renderer)) {
+		wlr_log(WLR_ERROR, "Synchronous cat masking requires WLR_RENDERER=gles2");
+		wlr_renderer_destroy(server.renderer);
+		wlr_backend_destroy(server.backend);
+		wl_display_destroy(server.wl_display);
+		return 1;
+	}
 
 	wlr_renderer_init_wl_display(server.renderer, server.wl_display);
 
@@ -1333,7 +1396,8 @@ int main(int argc, char *argv[]) {
 	server.filter_rect = wlr_scene_rect_create(server.filter_tree, 300, 200, black);
 	server.filter_x = 100;
 	server.filter_y = 100;
-	server.filter_visible = true;
+	server.filter_visible = false;
+	wlr_scene_node_set_enabled(&server.filter_rect->node, server.filter_visible);
 	update_filter_position(&server);
 
 	/* Set up xdg-shell version 3. The xdg-shell is a Wayland protocol which is
@@ -1410,10 +1474,25 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
+	const char *model_path = getenv("TINYWL_CAT_MODEL");
+	if (model_path == NULL) {
+		model_path = "cat-detector/nanodet.onnx";
+	}
+	char cat_error[256];
+	server.cat_detector = cat_detector_create(model_path, cat_error, sizeof(cat_error));
+	if (server.cat_detector == NULL) {
+		wlr_log(WLR_ERROR, "Could not load cat model '%s': %s", model_path, cat_error);
+		wlr_backend_destroy(server.backend);
+		wl_display_destroy(server.wl_display);
+		return 1;
+	}
+	wlr_log(WLR_INFO, "Loaded cat model: %s; synchronous detection on each rendered frame", model_path);
+
 	/* Start the backend. This will enumerate outputs and inputs, become the DRM
 	 * master, etc */
 	if (!wlr_backend_start(server.backend)) {
 		wlr_backend_destroy(server.backend);
+		cat_detector_destroy(server.cat_detector);
 		wl_display_destroy(server.wl_display);
 		return 1;
 	}
@@ -1461,6 +1540,7 @@ int main(int argc, char *argv[]) {
 	wlr_allocator_destroy(server.allocator);
 	wlr_renderer_destroy(server.renderer);
 	wlr_backend_destroy(server.backend);
+	cat_detector_destroy(server.cat_detector);
 	wl_display_destroy(server.wl_display);
 	return 0;
 }

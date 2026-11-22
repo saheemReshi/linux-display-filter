@@ -1,15 +1,16 @@
 # Standalone cat detector
 
-This stage reads an image and prints cat bounding boxes. It does not launch,
-modify, or communicate with TinyWL. It uses C++ and OpenCV's CPU DNN backend,
-with one OpenCV thread requested. No Python runtime is involved.
+The standalone command reads an image and prints cat bounding boxes. The same
+library is also linked into TinyWL for synchronous per-rendered-frame cat
+masking. It uses C++ and OpenCV's CPU DNN backend, with one OpenCV thread
+requested. No Python runtime is involved.
 
 ## Dependency and build
 
 On Arch/Omarchy, install the C++ development library if needed:
 
 ```sh
-sudo pacman -S --needed opencv
+sudo pacman -S --needed opencv libdrm
 ```
 
 Build from the TinyWL directory:
@@ -47,7 +48,8 @@ steady-state frame-rate measurement.
 
 The local image matrices release their resources when they leave scope. The
 detector retains its network until the detector object is destroyed. There are
-no sockets, worker threads, GPU rendering, or output commits.
+no sockets or worker threads in the detector. The standalone command does not
+render; TinyWL's integration performs the GPU mask pass and output commit.
 
 ## Reusing the detector
 
@@ -103,8 +105,78 @@ continues to work.
 - `cat_detector_destroy` releases the handle. Do not call `free` on it. NULL is
   accepted. Calls on one handle must be sequential.
 
-This stage accepts BGR pixels only. Conversion from TinyWL's four-byte DRM
-readback formats, and use from its rendering callbacks, remain separate steps.
+The C detector accepts BGR pixels only. TinyWL converts its readback pixels
+before calling it from the rendering callback.
+
+## Preparing readback pixels
+
+`readback_bgr.h` declares `cat_readback_to_bgr`; `readback_bgr.c` implements it in
+C. It is included in `libcat-detector.a` and called by TinyWL. It uses
+the existing libdrm format headers; it has no OpenCV dependency of its own.
+
+Pass the CPU pixels, their allocation size, dimensions, source stride, and DRM
+format. The supported layouts match TinyWL's current little-endian readback:
+
+| DRM format | Source bytes | BGR output |
+| --- | --- | --- |
+| ARGB8888 / XRGB8888 | B G R A-or-X | B G R |
+| ABGR8888 / XBGR8888 | R G B A-or-X | B G R |
+
+The converter validates the format, nonzero dimensions up to 8192, row stride,
+byte count, and row-addressing overflow. It allocates `width * 3 * height` bytes
+and copies pixels while omitting the fourth channel. Source row padding is
+skipped, and the destination has no padding. No resizing or normalization occurs
+here; those are already part of the detector.
+
+NULL means invalid input or allocation failure. On success the source remains
+unchanged and the caller owns the returned pixels. Set `cat_image_bgr.stride` to
+`width * 3` and `size_bytes` to `width * 3 * height` when passing that buffer to
+the detector. Keep it alive until the synchronous detection call returns, then
+release it with `free()`.
+
+## TinyWL integration
+
+Run from the TinyWL directory (one level above this README's directory):
+
+```sh
+make
+WLR_BACKENDS=wayland WLR_RENDERER=gles2 ./tinywl -s foot
+```
+
+On a virtual terminal, omit `WLR_BACKENDS=wayland` as in the existing running
+instructions. This synchronous GPU path requires the GLES2 renderer.
+
+The model is loaded once before the backend starts. The default path is
+`cat-detector/nanodet.onnx`, relative to the working directory. Set
+`TINYWL_CAT_MODEL` to use another path. A load failure prints an error and exits.
+
+Every rendered frame fully repaints the scene, reads the output buffer once,
+converts it to BGR, runs detection, and draws opaque grey rectangles over all
+accepted cat boxes in an additional GPU pass. `glFinish()` waits while the GLES2
+pass context is current; only then is the pass finalized and output committed.
+If detection or rendering fails, that frame is not committed. The normal
+scene-needs-frame check is retained: an unchanged desktop does not run inference
+repeatedly solely to match the monitor's refresh rate.
+
+Repainting and commit damage cover the whole output in this prototype, so old
+masks disappear when cats move or are no longer detected. The fixed grey test
+rectangle is gone; the legacy Alt+F2 scene overlay starts hidden and remains
+available through its keybinding.
+
+There is one detector per server, with sequential calls across outputs. Each
+output retains a reusable box array, growing it and retrying detection if
+necessary. Readback and BGR allocations are freed each frame; output box storage
+is freed when its output is destroyed, and the detector at server shutdown.
+
+Alt+P is only a screenshot request. It saves the same clean, pre-mask readback
+as `capture.ppm`, without a second readback. It is not a detection trigger.
+Debug logs report cat counts and model-forward time for processed frames; that
+time excludes rendering, readback, conversion, and grey drawing. This deliberately
+synchronous prototype can reduce frame rate and delay input while processing.
+
+To test, open a cat photo inside TinyWL. Grey regions should appear without
+pressing a key. Move the image and then close it to check mask movement/removal.
+Alt+Escape exits TinyWL.
 
 ## Reading the implementation
 
