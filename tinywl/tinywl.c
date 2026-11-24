@@ -48,12 +48,7 @@ struct tinywl_server {
 	struct wlr_allocator *allocator;
 	struct wlr_scene *scene;
 	struct wlr_scene_output_layout *scene_layout;
-	struct wlr_scene_tree *application_tree;
-	struct wlr_scene_tree *filter_tree;
-	struct wlr_scene_rect *filter_rect;
-	int filter_x, filter_y;
-	bool filter_visible;
-	bool capture_requested; /* Capture clean scene pixels on Alt+P. */
+	/* One loaded model shared by all outputs; calls run sequentially here. */
 	struct cat_detector *cat_detector;
 	struct wlr_xdg_shell *xdg_shell;
 	struct wl_listener new_xdg_toplevel;
@@ -92,8 +87,10 @@ struct tinywl_output {
 	struct wl_listener frame;
 	struct wl_listener request_state;
 	struct wl_listener destroy;
+	/* Boxes use this output's pixel coordinates, not desktop-wide coordinates.
+	 * Reuse this allocation between frames; output_destroy() frees it. */
 	struct cat_box *cat_boxes;
-	size_t cat_capacity;
+	size_t cat_capacity; /* Allocated box slots, not the number of detected cats. */
 };
 
 struct tinywl_toplevel {
@@ -126,77 +123,6 @@ struct tinywl_keyboard {
 	struct wl_listener key;
 	struct wl_listener destroy;
 };
-
-static void update_filter_position(struct tinywl_server *server) {
-	wlr_scene_node_set_position(&server->filter_rect->node,
-		server->filter_x, server->filter_y);
-}
-static void inspect_scene_buffer(
-        struct wlr_scene_buffer *scene_buffer,
-        int sx, int sy, void *user_data) {
-
-    if (scene_buffer->buffer == NULL) {
-        return;
-    }
-
-    struct wlr_buffer *buffer = scene_buffer->buffer;
-	void *pixels = NULL;
-	uint32_t format = 0;
-	size_t stride = 0;
-
-	bool success = wlr_buffer_begin_data_ptr_access(
-		buffer,
-		WLR_BUFFER_DATA_PTR_ACCESS_READ,
-		&pixels,
-		&format,
-		&stride
-	);
-
-	if (success) {
-		wlr_log(WLR_INFO,
-			"CPU access OK: %dx%d, format=0x%08x, stride=%zu",
-			buffer->width, buffer->height, format, stride);
-
-		if (pixels != NULL && stride >= 4 &&
-				buffer->width > 0 && buffer->height > 0) {
-			const unsigned char *p = pixels;
-
-			wlr_log(WLR_INFO,
-				"First four pixel bytes: %02x %02x %02x %02x",
-				p[0], p[1], p[2], p[3]);
-		}
-
-		wlr_buffer_end_data_ptr_access(buffer);
-	} else {
-		wlr_log(WLR_INFO,
-			"CPU access unavailable: %dx%d",
-			buffer->width, buffer->height);
-	}
-
-    wlr_log(WLR_INFO,
-        "Buffer: %dx%d at layout position (%d, %d)",
-        buffer->width,
-        buffer->height,
-        sx, sy);
-
-    int *count = user_data;
-    (*count)++;
-}
-
-static void inspect_application_buffers(
-        struct tinywl_server *server) {
-
-    int count = 0;
-
-    wlr_scene_node_for_each_buffer(
-        &server->application_tree->node,
-        inspect_scene_buffer,
-        &count
-    );
-
-    wlr_log(WLR_INFO,
-        "Found %d application scene buffers", count);
-}
 
 static void focus_toplevel(struct tinywl_toplevel *toplevel) {
 	/* Note: this function only deals with keyboard focus. */
@@ -280,39 +206,6 @@ static bool handle_keybinding(struct tinywl_server *server, xkb_keysym_t sym) {
 			wl_container_of(server->toplevels.prev, next_toplevel, link);
 		focus_toplevel(next_toplevel);
 		break;
-	case XKB_KEY_F2:
-		server->filter_visible = !server->filter_visible;
-		wlr_scene_node_set_enabled(&server->filter_rect->node,
-			server->filter_visible);
-		break;
-	case XKB_KEY_Left:
-		server->filter_x -= 20;
-		update_filter_position(server);
-		break;
-	case XKB_KEY_Right:
-		server->filter_x += 20;
-		update_filter_position(server);
-		break;
-	case XKB_KEY_Up:
-		server->filter_y -= 20;
-		update_filter_position(server);
-		break;
-	case XKB_KEY_Down:
-		server->filter_y += 20;
-		update_filter_position(server);
-		break;
-	case XKB_KEY_b:
-		inspect_application_buffers(server);
-		break;
-	case XKB_KEY_p: {
-		server->capture_requested = true;
-		struct tinywl_output *output;
-		wl_list_for_each(output, &server->outputs, link) {
-			wlr_output_schedule_frame(output->wlr_output);
-		}
-		wlr_log(WLR_INFO, "Clean scene capture requested");
-		break;
-	}
 	default:
 		return false;
 	}
@@ -481,11 +374,10 @@ static void seat_request_set_selection(struct wl_listener *listener, void *data)
 static struct tinywl_toplevel *desktop_toplevel_at(
 		struct tinywl_server *server, double lx, double ly,
 		struct wlr_surface **surface, double *sx, double *sy) {
-	/* Only applications participate in hit-testing; the filter is visual-only.
-	 * We only care about surface nodes as we are specifically looking for a
+	/* We only care about surface nodes as we are specifically looking for a
 	 * surface in the surface tree of a tinywl_toplevel. */
 	struct wlr_scene_node *node = wlr_scene_node_at(
-		&server->application_tree->node, lx, ly, sx, sy);
+		&server->scene->tree.node, lx, ly, sx, sy);
 	if (node == NULL || node->type != WLR_SCENE_NODE_BUFFER) {
 		return NULL;
 	}
@@ -691,6 +583,9 @@ static void server_cursor_frame(struct wl_listener *listener, void *data) {
 	wlr_seat_pointer_notify_frame(server->seat);
 }
 
+/* A CPU copy of one clean rendered frame, before grey masks are drawn.
+ * stride is the number of bytes between row starts; format describes the
+ * channel order. This memory is separate from the GPU output buffer. */
 struct tinywl_image {
     uint8_t *data;
     uint32_t width, height;
@@ -698,13 +593,18 @@ struct tinywl_image {
     uint32_t format;
 };
 
-/* On success, the caller owns image->data and must free() it. */
+/* Borrow buffer and renderer; neither belongs to this helper.
+ * On success, the caller owns image->data and must free() it.
+ * On failure, temporary allocations are released here. wlr_log() reports
+ * errors through wlroots' logger; it does not change the output image. */
 static bool read_output_pixels(
         struct wlr_renderer *renderer,
         struct wlr_buffer *buffer,
         struct tinywl_image *image) {
 
-    // Import the output buffer as a renderer texture.
+    /* Make a renderer texture referring to the existing output buffer.
+     * A texture is a renderer-accessible image, not yet a CPU pixel copy.
+     * This call can fail if the renderer cannot import the buffer. */
     struct wlr_texture *texture =
         wlr_texture_from_buffer(renderer, buffer);
 
@@ -715,10 +615,10 @@ static bool read_output_pixels(
 
     uint32_t width = texture->width;
     uint32_t height = texture->height;
+    /* Ask which CPU pixel format this renderer prefers for readback. */
     uint32_t format = wlr_texture_preferred_read_format(texture);
 
-    // This first experiment supports common 8-bit,
-    // 4-byte-per-pixel formats on little-endian machines.
+    /* Support common 8-bit, four-byte pixel formats on little-endian hosts. */
     bool rgb_order =
         format == DRM_FORMAT_ABGR8888 ||
         format == DRM_FORMAT_XBGR8888;
@@ -731,12 +631,15 @@ static bool read_output_pixels(
             width == 0 || height == 0 ||
             width > 8192 || height > 8192) {
         wlr_log(WLR_ERROR,
-            "Unsupported capture dimensions/format: %ux%u 0x%08x",
+            "Unsupported output readback dimensions/format: %ux%u 0x%08x",
             width, height, format);
+        /* Release the imported texture reference, not the caller's buffer. */
         wlr_texture_destroy(texture);
         return false;
     }
 
+    /* Four bytes per pixel. malloc() reserves CPU memory for all rows;
+     * the dimension checks above bound this multiplication/allocation. */
     uint32_t stride = width * 4;
     uint8_t *pixels = malloc((size_t)stride * height);
 
@@ -745,13 +648,18 @@ static bool read_output_pixels(
         return false;
     }
 
+    /* Tell readback where to write, how to order channels, and row spacing. */
     struct wlr_texture_read_pixels_options options = {
         .data = pixels,
         .format = format,
         .stride = stride,
     };
 
+    /* Copy GPU pixels into pixels. This synchronous call returns with CPU
+     * data ready to use; GLES2 readback waits for preceding GPU work.
+     * Its wait does not cover grey rectangles drawn later in this frame. */
     bool success = wlr_texture_read_pixels(texture, &options);
+    /* The copy survives destruction of this temporary texture reference. */
     wlr_texture_destroy(texture);
 
     if (!success) {
@@ -760,6 +668,7 @@ static bool read_output_pixels(
         return false;
     }
 
+    /* Return the allocated pixels and their layout; ownership passes out. */
     *image = (struct tinywl_image){
         .data = pixels,
         .width = width,
@@ -770,69 +679,13 @@ static bool read_output_pixels(
     return true;
 }
 
-/* Borrows the clean CPU image; the caller retains ownership of its pixels. */
-static bool save_output_ppm(const struct tinywl_image *image) {
-    const uint8_t *pixels = image->data;
-    uint32_t width = image->width, height = image->height;
-    uint32_t stride = image->stride;
-    bool rgb_order = image->format == DRM_FORMAT_ABGR8888 ||
-        image->format == DRM_FORMAT_XBGR8888;
-
-    // PPM stores 3 bytes per pixel: R, G, B.
-    FILE *file = fopen("capture.ppm", "wb");
-    if (file == NULL) {
-        return false;
-    }
-
-    fprintf(file, "P6\n%u %u\n255\n", width, height);
-
-    uint8_t *row = malloc((size_t)width * 3);
-    if (row == NULL) {
-        fclose(file);
-        return false;
-    }
-
-    bool success = true;
-
-    for (uint32_t y = 0; y < height; y++) {
-        const uint8_t *src = pixels + (size_t)y * stride;
-
-        for (uint32_t x = 0; x < width; x++) {
-            const uint8_t *p = src + x * 4;
-
-            // Convert the DRM format's memory byte order
-            // into RGB for the PPM file.
-            row[x * 3 + 0] = rgb_order ? p[0] : p[2];
-            row[x * 3 + 1] = p[1];
-            row[x * 3 + 2] = rgb_order ? p[2] : p[0];
-        }
-
-        if (fwrite(row, 1, (size_t)width * 3, file)
-                != (size_t)width * 3) {
-            success = false;
-            break;
-        }
-    }
-
-    if (fclose(file) != 0) {
-        success = false;
-    }
-
-    free(row);
-
-    if (success) {
-        wlr_log(WLR_INFO, "Saved capture.ppm (%ux%u)",
-            width, height);
-    } else {
-        wlr_log(WLR_ERROR, "Failed to save complete PPM");
-    }
-
-    return success;
-}
-
+/* Borrow image pixels and the server's model. Return boxes in output-owned
+ * storage: result->boxes must not be freed by the caller. Its contents can
+ * change on the next detection, and growing storage can move the array. */
 static bool detect_output_cats(struct tinywl_output *output,
 		const struct tinywl_image *image, struct cat_result *result) {
 	if (output->cat_capacity == 0) {
+		/* Allocate room for 64 boxes on this output's first processed frame. */
 		output->cat_boxes = malloc(64 * sizeof(*output->cat_boxes));
 		if (output->cat_boxes == NULL) {
 			wlr_log(WLR_ERROR, "Could not allocate cat box storage");
@@ -840,6 +693,8 @@ static bool detect_output_cats(struct tinywl_output *output,
 		}
 		output->cat_capacity = 64;
 	}
+	/* Allocate a three-byte B,G,R copy for OpenCV. The converter removes the
+	 * fourth channel and reorders R/B if required; it borrows image->data. */
 	uint8_t *bgr = cat_readback_to_bgr(image->data,
 		(size_t)image->stride * image->height, image->width, image->height,
 		image->stride, image->format);
@@ -847,23 +702,32 @@ static bool detect_output_cats(struct tinywl_output *output,
 		wlr_log(WLR_ERROR, "Could not convert output pixels to BGR");
 		return false;
 	}
+	/* Describe the BGR allocation without making another pixel copy. */
 	struct cat_image_bgr input = {
 		.data = bgr, .width = image->width, .height = image->height,
 		.stride = (size_t)image->width * 3,
 		.size_bytes = (size_t)image->width * 3 * image->height,
 	};
+	/* Give the C interface our destination array and its slot count.
+	 * It writes the actual detection count and timing into this result. */
 	*result = (struct cat_result){
 		.boxes = output->cat_boxes, .capacity = output->cat_capacity,
 	};
 	char error[256];
+	/* Run the C++ model through its C interface. This blocks this event-loop
+	 * thread until inference and box decoding finish; no worker is started. */
 	int status = cat_detector_detect(output->server->cat_detector,
 		&input, result, error, sizeof(error));
 	if (status == CAT_BUFFER_TOO_SMALL) {
+		/* The interface reports how many slots it needs without writing a
+		 * partial box list. Check byte-count overflow before growing it. */
 		if (result->count > SIZE_MAX / sizeof(*output->cat_boxes)) {
 			free(bgr);
 			wlr_log(WLR_ERROR, "Cat box allocation size overflow");
 			return false;
 		}
+		/* realloc() may move the allocation. Keep the old pointer until
+		 * success, since failure leaves the old allocation valid. */
 		struct cat_box *boxes = realloc(output->cat_boxes,
 			result->count * sizeof(*output->cat_boxes));
 		if (boxes == NULL) {
@@ -875,9 +739,13 @@ static bool detect_output_cats(struct tinywl_output *output,
 		output->cat_capacity = result->count;
 		result->boxes = boxes;
 		result->capacity = output->cat_capacity;
+		/* Rerun on the same pixels with enough space for every box.
+		 * This simple fallback performs inference a second time. */
 		status = cat_detector_detect(output->server->cat_detector,
 			&input, result, error, sizeof(error));
 	}
+	/* Detection has finished reading these pixels; boxes contain values,
+	 * not pointers into bgr, so freeing this temporary image is safe. */
 	free(bgr);
 	if (status != CAT_OK) {
 		wlr_log(WLR_ERROR, "Cat detection failed: %s", error);
@@ -888,18 +756,27 @@ static bool detect_output_cats(struct tinywl_output *output,
 	return true;
 }
 
+/* Borrow state->buffer and the box array. Modify GPU pixels in place;
+ * output_frame() still owns state and is responsible for committing it. */
 static bool render_cat_boxes(struct wlr_renderer *renderer,
 		struct wlr_output_state *state, const struct cat_result *cats) {
 	/* Both repaint and commit damage are whole-output in this prototype.
 	 * This also removes old masks on frames where no cats are detected. */
 	pixman_region32_t damage;
+	/* Create a rectangle covering the buffer. Damage tells the output backend
+	 * which pixels may differ; it does not draw or erase anything itself. */
 	pixman_region32_init_rect(&damage, 0, 0, state->buffer->width, state->buffer->height);
+	/* This copies the region into state, so the temporary can be freed. */
 	wlr_output_state_set_damage(state, &damage);
 	pixman_region32_fini(&damage);
 	if (cats->count == 0) {
+		/* The full scene repaint already removed any previous frame's masks. */
 		return true;
 	}
 
+	/* Begin another GPU pass targeting the SAME rendered buffer. We do not
+	 * clear it: with our GLES2 path, pixels outside the rectangles survive.
+	 * NULL selects default pass options. The pass borrows the target buffer. */
 	struct wlr_render_pass *pass =
 		wlr_renderer_begin_buffer_pass(renderer, state->buffer, NULL);
 	if (pass == NULL) {
@@ -909,84 +786,91 @@ static bool render_cat_boxes(struct wlr_renderer *renderer,
 
 	for (size_t i = 0; i < cats->count; ++i) {
 		const struct cat_box *box = &cats->boxes[i];
+		/* Draw in buffer pixel coordinates. Alpha 1 and BLEND_MODE_NONE
+		 * replace covered pixels with solid grey rather than blending them. */
 		wlr_render_pass_add_rect(pass, &(struct wlr_render_rect_options){
 			.box = { .x = box->x, .y = box->y, .width = box->width, .height = box->height },
 			.color = { .r = 0.5f, .g = 0.5f, .b = 0.5f, .a = 1.0f },
 			.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
 		});
 	}
-	/* GLES2 issues drawing immediately; wait while its context is current. */
+	/* Our GLES2 renderer issues drawing during add_rect(). glFinish() blocks
+	 * this CPU thread until earlier work in the current GL context finishes.
+	 * Do this before submit(), which can stop that context being current.
+	 * This is a separate wait from readback: masks were drawn AFTER readback. */
 	glFinish();
+	/* Finalize and release the pass. This does not present the image;
+	 * wlr_output_commit_state() below submits it to the output backend. */
 	return wlr_render_pass_submit(pass);
 }
 
 static void output_frame(struct wl_listener *listener, void *data) {
 	/* This function is called every time an output is ready to display a frame,
 	 * generally at the output's refresh rate (e.g. 60Hz). */
+	/* The callback receives a pointer to the embedded frame listener.
+	 * wl_container_of() finds the tinywl_output struct containing it. */
 	struct tinywl_output *output = wl_container_of(listener, output, frame);
 	struct wlr_scene *scene = output->server->scene;
 
+	/* Find the scene's rendering/damage bookkeeping for this display. */
 	struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(
 		scene, output->wlr_output);
 
-	/* Render the scene if needed and commit the output */
-	//wlr_scene_output_commit(scene_output, NULL);  opening up this function below
-	if (output->server->capture_requested ||
-			wlr_scene_output_needs_frame(scene_output)) {
+	/* Render, detect cats, and mask them before committing each new frame. */
+	/* Skip rendering/inference when the scene needs no new frame. Every
+	 * rendered frame goes through detection; idle refreshes do not rerun it. */
+	if (wlr_scene_output_needs_frame(scene_output)) {
 		struct wlr_output_state state;
+		/* Initialize a temporary collection of changes for one output commit. */
 		wlr_output_state_init(&state);
 
-		/* Always give the detector a clean scene, including reused buffers. */
+		/* Repaint the entire scene, including reused buffers. Otherwise an old
+		 * grey mask could survive and even hide a cat from the next detection. */
 		wlr_damage_ring_add_whole(&scene_output->damage_ring);
 
-		/* Require composition for future output post-processing. */
+		/* Temporarily disable direct scanout (displaying a client's buffer
+		 * directly). We need a compositor-rendered buffer that we can modify. */
 		wlr_output_lock_attach_render(output->wlr_output, true);
+		/* Render scene windows into an output buffer and attach it to state.
+		 * This prepares a frame; it does not commit it for display yet. */
 		bool ok = wlr_scene_output_build_state(
 			scene_output, &state, NULL);
+		/* Balance our lock even if building failed; state keeps its buffer
+		 * reference until wlr_output_state_finish(). */
 		wlr_output_lock_attach_render(output->wlr_output, false);
 
 		if (ok) {
-			// Our interception point
-			// if ((state.committed & WLR_OUTPUT_STATE_BUFFER) &&
-			// 		state.buffer != NULL) {
-
-			// 	static bool logged = false;
-
-			// 	if (!logged) {
-			// 		wlr_log(WLR_INFO,
-			// 			"Output buffer: %dx%d",
-			// 			state.buffer->width,
-			// 			state.buffer->height);
-
-			// 		logged = true;
-			// 	}
-			// }
+			/* committed is a bitmask of fields supplied in state, despite its
+			 * name: it does not mean this frame was already displayed. */
 			if ((state.committed & WLR_OUTPUT_STATE_BUFFER) &&
 					state.buffer != NULL) {
 				struct tinywl_image image = {0};
+				/* GPU scene -> newly allocated CPU pixel copy. */
 				ok = read_output_pixels(output->wlr_output->renderer, state.buffer, &image);
 				if (ok) {
-					if (output->server->capture_requested) {
-						output->server->capture_requested = false;
-						if (!save_output_ppm(&image)) {
-							wlr_log(WLR_ERROR, "Could not save capture.ppm");
-						}
-					}
 					struct cat_result cats = {0};
+					/* CPU pixels -> boxes stored in this output's reusable array. */
 					ok = detect_output_cats(output, &image, &cats);
 					if (ok) {
+						/* Draw into state.buffer, not into the CPU image copy. */
 						ok = render_cat_boxes(output->wlr_output->renderer, &state, &cats);
 					}
+					/* No later step needs the CPU readback, including on failure. */
 					free(image.data);
 				}
 			}
 
 			if (ok) {
+				/* Submit the modified buffer for presentation. The backend/display
+				 * determines when it appears; returning does not imply scanout ended.
+				 * A failed readback, detection, or mask pass skips this commit. */
 				ok = wlr_output_commit_state(
 					output->wlr_output, &state);
 			}
 		}
 
+		/* Release temporary state resources and its buffer reference. A
+		 * successful commit retains whatever references the backend needs. */
 		wlr_output_state_finish(&state);
 
 		if (!ok) {
@@ -995,6 +879,9 @@ static void output_frame(struct wl_listener *listener, void *data) {
 	}
 
 	struct timespec now;
+	/* Timestamp client frame callbacks with a clock unaffected by wall-clock
+	 * adjustments. Frame-done permits clients to prepare their next frame;
+	 * it is not a GPU fence or confirmation of physical presentation. */
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	wlr_scene_output_send_frame_done(scene_output, &now);
 }
@@ -1015,6 +902,7 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&output->request_state.link);
 	wl_list_remove(&output->destroy.link);
 	wl_list_remove(&output->link);
+	/* Boxes belong to this output and are no longer needed after removal. */
 	free(output->cat_boxes);
 	free(output);
 }
@@ -1223,7 +1111,7 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
 	toplevel->server = server;
 	toplevel->xdg_toplevel = xdg_toplevel;
 	toplevel->scene_tree =
-		wlr_scene_xdg_surface_create(toplevel->server->application_tree, xdg_toplevel->base);
+		wlr_scene_xdg_surface_create(&server->scene->tree, xdg_toplevel->base);
 	toplevel->scene_tree->node.data = toplevel;
 	xdg_toplevel->base->data = toplevel->scene_tree;
 
@@ -1340,6 +1228,9 @@ int main(int argc, char *argv[]) {
 		wlr_log(WLR_ERROR, "failed to create wlr_renderer");
 		return 1;
 	}
+	/* Check the renderer type, not the GPU model. Our mask helper relies on
+	 * GLES2's immediate drawing and current GL context for glFinish(); a
+	 * different renderer would need its own synchronization approach. */
 	if (!wlr_renderer_is_gles2(server.renderer)) {
 		wlr_log(WLR_ERROR, "Synchronous cat masking requires WLR_RENDERER=gles2");
 		wlr_renderer_destroy(server.renderer);
@@ -1382,23 +1273,11 @@ int main(int argc, char *argv[]) {
 	server.new_output.notify = server_new_output;
 	wl_signal_add(&server.backend->events.new_output, &server.new_output);
 
-	/* Create a scene graph. This is a wlroots abstraction that handles all
-	 * rendering and damage tracking. All the compositor author needs to do
-	 * is add things that should be rendered to the scene graph at the proper
-	 * positions and then call wlr_scene_output_commit() to render a frame if
-	 * necessary.
-	 */
+	/* The scene graph renders application windows and tracks their damage.
+	 * output_frame() builds its output buffer, then detects and masks cats
+	 * before committing it for display. */
 	server.scene = wlr_scene_create();
 	server.scene_layout = wlr_scene_attach_output_layout(server.scene, server.output_layout);
-	server.application_tree = wlr_scene_tree_create(&server.scene->tree);
-	server.filter_tree = wlr_scene_tree_create(&server.scene->tree);
-	const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-	server.filter_rect = wlr_scene_rect_create(server.filter_tree, 300, 200, black);
-	server.filter_x = 100;
-	server.filter_y = 100;
-	server.filter_visible = false;
-	wlr_scene_node_set_enabled(&server.filter_rect->node, server.filter_visible);
-	update_filter_position(&server);
 
 	/* Set up xdg-shell version 3. The xdg-shell is a Wayland protocol which is
 	 * used for application windows. For more detail on shells, refer to
@@ -1474,11 +1353,14 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
+	/* getenv() borrows an environment string; use the default if unset. */
 	const char *model_path = getenv("TINYWL_CAT_MODEL");
 	if (model_path == NULL) {
 		model_path = "cat-detector/nanodet.onnx";
 	}
 	char cat_error[256];
+	/* Load ONNX weights once, before frames can arrive. The C interface
+	 * returns an owned handle or NULL plus a bounded error message. */
 	server.cat_detector = cat_detector_create(model_path, cat_error, sizeof(cat_error));
 	if (server.cat_detector == NULL) {
 		wlr_log(WLR_ERROR, "Could not load cat model '%s': %s", model_path, cat_error);
@@ -1492,6 +1374,7 @@ int main(int argc, char *argv[]) {
 	 * master, etc */
 	if (!wlr_backend_start(server.backend)) {
 		wlr_backend_destroy(server.backend);
+		/* Release the already-loaded model if backend startup fails. */
 		cat_detector_destroy(server.cat_detector);
 		wl_display_destroy(server.wl_display);
 		return 1;
@@ -1540,6 +1423,8 @@ int main(int argc, char *argv[]) {
 	wlr_allocator_destroy(server.allocator);
 	wlr_renderer_destroy(server.renderer);
 	wlr_backend_destroy(server.backend);
+	/* Destroy through the C++ interface, not free(): it releases OpenCV's
+	 * network and its allocations as well as the handle itself. */
 	cat_detector_destroy(server.cat_detector);
 	wl_display_destroy(server.wl_display);
 	return 0;

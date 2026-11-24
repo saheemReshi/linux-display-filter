@@ -34,7 +34,7 @@ sha256sum --check model.sha256
 ./detect-cats nanodet.onnx /path/to/cat.jpg
 ```
 
-You can also pass `../capture.ppm`. The input is letterboxed to 416 by 416,
+The input is letterboxed to 416 by 416,
 then normalized with the model's BGR channel means and standard deviations.
 The program decodes the raw outputs, keeps cats with confidence at least 0.5,
 and suppresses overlapping duplicate predictions using an IoU threshold of 0.6.
@@ -159,24 +159,21 @@ scene-needs-frame check is retained: an unchanged desktop does not run inference
 repeatedly solely to match the monitor's refresh rate.
 
 Repainting and commit damage cover the whole output in this prototype, so old
-masks disappear when cats move or are no longer detected. The fixed grey test
-rectangle is gone; the legacy Alt+F2 scene overlay starts hidden and remains
-available through its keybinding.
+masks disappear when cats move or are no longer detected.
 
 There is one detector per server, with sequential calls across outputs. Each
 output retains a reusable box array, growing it and retrying detection if
 necessary. Readback and BGR allocations are freed each frame; output box storage
 is freed when its output is destroyed, and the detector at server shutdown.
 
-Alt+P is only a screenshot request. It saves the same clean, pre-mask readback
-as `capture.ppm`, without a second readback. It is not a detection trigger.
 Debug logs report cat counts and model-forward time for processed frames; that
 time excludes rendering, readback, conversion, and grey drawing. This deliberately
 synchronous prototype can reduce frame rate and delay input while processing.
 
 To test, open a cat photo inside TinyWL. Grey regions should appear without
 pressing a key. Move the image and then close it to check mask movement/removal.
-Alt+Escape exits TinyWL.
+Alt+Escape exits TinyWL; Alt+F1 cycles between windows. Detection and masking
+run automatically, without experimental capture or overlay keybindings.
 
 ## Reading the implementation
 

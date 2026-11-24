@@ -6,11 +6,12 @@
 #include <opencv2/dnn.hpp>
 
 struct CatDetection {
-	cv::Rect box;
+	cv::Rect box; // Integer x/y/width/height in the original image's pixels.
 	float confidence;
 };
 
 struct DetectionResult {
+	// Owns box values; destruction releases the vector's allocation.
 	std::vector<CatDetection> cats;
 	double inference_ms;
 };
@@ -26,6 +27,6 @@ public:
 
 private:
 	static constexpr int input_size = 416;
-	cv::dnn::Net net_;
-	cv::dnn::Image2BlobParams params_;
+	cv::dnn::Net net_; // Loaded model/weights reused for successive frames.
+	cv::dnn::Image2BlobParams params_; // Resize, padding, and channel normalization.
 };
